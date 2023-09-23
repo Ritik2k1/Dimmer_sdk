@@ -1,0 +1,71 @@
+menu "Example Configuration"
+
+config ROUTER_SSID
+    string "Router SSID"
+        default "esp-liyin"
+        help
+            Router SSID.
+
+config ROUTER_PASSWORD
+    string "Router password"
+        default "espressif"
+        help
+            Router password.
+
+config MESH_ID
+    string "Mesh ID"
+        default "123456"
+        help
+            Mesh network identification, Nodes with the same mesh ID can
+            communicate with each other.
+
+config MESH_PASSWORD
+    string "Mesh Password"
+    default "MESH_PASSWORD"
+    help
+        Mesh AP password. Password length must be 8 bits smaller than 64 bits,Set to null to not encrypt
+
+config MQTT_URL
+    string "MQTT broker URL"
+    default "mqtt://iot.eclipse.org"
+    help
+        URL of the broker to connect to
+
+
+choice EXAMPLE_CERT_SOURCE
+    prompt "AWS IoT Certificate Source"
+    default EXAMPLE_EMBEDDED_CERTS
+    help
+       AWS IoT requires loading of a device-specific certificate and private key,
+       and a common Root CA Certificate. These can be compiled into the example
+       app, or they can be loaded via the filesystem from an SD card.
+
+config EXAMPLE_EMBEDDED_CERTS
+    bool "Embed into app"
+config EXAMPLE_SDCARD_CERTS
+    bool "Load from SD card"
+    select EXAMPLE_FILESYSTEM_CERTS
+endchoice
+
+# Currently this is equivalent to EXAMPLE_SDCARD_CERTS,
+# however eventually we want to support more filesystem
+# sources (SPIFFS, etc.) So this hidden config item
+# is selected whenever the item should load from filesystem.
+config EXAMPLE_FILESYSTEM_CERTS
+    bool
+
+config EXAMPLE_CERTIFICATE_PATH
+    string "Device Certificate Path"
+    depends on EXAMPLE_FILESYSTEM_CERTS
+    default "/sdcard/certificate.pem.crt"
+
+config EXAMPLE_PRIVATE_KEY_PATH
+    string "Device Private Key Path"
+    depends on EXAMPLE_FILESYSTEM_CERTS
+    default "/sdcard/private.pem.key"
+
+config EXAMPLE_ROOT_CA_PATH
+    string "Root CA Certificate Path"
+    depends on EXAMPLE_FILESYSTEM_CERTS
+    default "/sdcard/aws-root-ca.pem"
+endmenu

@@ -1,0 +1,6 @@
+key,type,encoding,value
+us_info_system,namespace,,
+ca_root,file,binary,certs/aws-root-ca.pem
+ca_key,file,binary,device-009-3c71bfb38338/009-3c71bfb38338.devicePriv.key
+ca_crt,file,binary,device-009-3c71bfb38338/009-3c71bfb38338.deviceCertAndCACert.crt
+us_info_sch,namespace,,

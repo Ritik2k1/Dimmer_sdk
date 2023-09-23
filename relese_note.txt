@@ -1,0 +1,20 @@
+Version 0.5.15 update:
+1. Add  commsssion to command `update_state`.
+2.Support ca_config, see below. Note: You must send certificate_crt and   private_key separately,Because the device cannot process so much data at once.
+{
+  "name": "batch_command",
+  "data": {
+    "method": "ca_config",
+    "certificate_crt": "-----BEGIN CERTIFICATE-----\nMIIDWTCCAkGgAwIBAgIUMEKWXS5EDrrQzvf2UMkIHWagA80wDQYJKoZIhvcNAQEL\nBQAwTTFLMEkGA1UECwxCQW1hem9uIFdlYiBTZXJ2aWNlcyBPPUFtYXpvbi5jb20g\nSW5jLiBMPVNlYXR0bGUgU1Q9V2FzaGluZ3RvbiBDPVVTMB4XDTIwMDUwODE2MTk1\nOFoXDTQ5MTIzMTIzNTk1OVowHjEcMBoGA1UEAwwTQVdTIElvVCBDZXJ0aWZpY2F0\nZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMrFga3tE6PBwkgyKRkm\nZgbD8sOB06zzUK2FgKOc7nhCRpx2xXsEYHpej5w5E4B/NXLintPRmi0D+IdDxKA6\ntzcKYl6iKrmYPQtnQrGjmkEXn1MfqQVfbTCLT4PIkyvXya3nrzcLIYmZcw4S1av+\n0t8fMwIXhMRPhcKR7wuJJrI2/uCKutnql01z4AoAfZp+lwTACOyReyVCs+MFbv8G\nP2UKBCLDzFmXWfmUTNq/Rs1lL0j6HwcvktUISSlm8bBnPyI+VLgoC4glMO0vfKt8\nqwblKPo6CZDnAoSHABbAxloeLuOKaf8MGilWUPaSNjJexKWMrT8qvqHCWUhAu8Po\n/aECAwEAAaNgMF4wHwYDVR0jBBgwFoAU+PmGNm1n4VS1emyDm50/zpU1eMYwHQYD\nVR0OBBYEFM8BSTWye51oYxHonONA+LsHY4YpMAwGA1UdEwEB/wQCMAAwDgYDVR0P\nAQH/BAQDAgeAMA0GCSqGSIb3DQEBCwUAA4IBAQAbSHhNAhFhDCWIvTuvwMiuN5GZ\nLIV3egQLgE05dkj82VTFho7zGGBdKxEwKwNRb3wWhhcKdKRRJbDQ2OI5aS3yIyAQ\nQAT39vo+Qpt4Oy+EihXc+1x20RSlVvfP9d/U0MLQ/xhU10k84ieBtOMg/t1ioyGi\n/xvC/tmkxXiOz1uDr6JUNl4gMB2OOcSKAGL+PC51J5HcxnhKIY48xjLYgMCwOK55\nsT70TT+pWCu5vaEliIDY8rvwcENsr7trHHgjrbzQn8m7EfSEBRKw+HAUuaV3VMSW\nWtm5R+s95z+AnGlIiwpcEHZdQTnLN6lCBVdPbm+HqaQAKx7wMAFkSp0SifV7\n-----END CERTIFICATE-----",
+    "private_key": "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAysWBre0To8HCSDIpGSZmBsPyw4HTrPNQrYWAo5zueEJGnHbF\newRgel6PnDkTgH81cuKe09GaLQP4h0PEoDq3NwpiXqIquZg9C2dCsaOaQRefUx+p\nBV9tMItPg8iTK9fJreevNwshiZlzDhLVq/7S3x8zAheExE+FwpHvC4kmsjb+4Iq6\n2eqXTXPgCgB9mn6XBMAI7JF7JUKz4wVu/wY/ZQoEIsPMWZdZ+ZRM2r9GzWUvSPof\nBy+S1QhJKWbxsGc/Ij5UuCgLiCUw7S98q3yrBuUo+joJkOcChIcAFsDGWh4u44pp\n/wwaKVZQ9pI2Ml7EpYytPyq+ocJZSEC7w+j9oQIDAQABAoIBAG2H3LHfs1Es0859\n0fd0533WEOeM1JPC5xykVcWLesFZQ503BxuZVKglNjv0FNW/YVbKlXLj8P1J/NDM\nSYUn0loX8OUfgia41pi3Ua51Kljo8rZLDtkJIAkt52jPSrhPGvEmil4YVChozF6Y\ny/TZdHzz9HC31Y7ZSe69N7wqfM2cscIbgMRs5eqgv/x5TT2vnIfoWOXubTld4KXa\n3f4uzpbPBS7ldgPBchtx+/pRkdaEGYDUCXKtB+wA499nlPr7jDciH5KSAOB0xUpU\nWu0bh+GghKaMKsnqZToVWFBAun586OK4cVV+xzHLx4jTXJrV5ompFXrVNc8Ms3El\nJCARAzECgYEA/v+Si9xrTUEV9yVh2x2Vo7LR8FPLso8G0Zg1yc4Zqs1Y6HRvbnza\nld7Sx7drE20SD7r/hjj5phBxwupZs1HFK+I+TjW+SzYfZ8uLpYQmUex6iZJb6uLb\nFuRQzrqPcvQcSS5s3cfClJ3NXsdbooyCansEMh3i84Qbmj4RRV0Xta0CgYEAy5Fq\nIVLF0KD0GijAjV1wmJzGusRTPmVImpvkuduyJvAXefNXehAzPVcdteeULuvMPg6s\nPggJdjGf+g46oe9o6qBIwQvmcmX74WRjgfxX1nsMGT2Oz24TcoKjYnUN1fIr34Fu\nE5pzd1pTQenxrCsTF2p7wobMLLWaDwrRSvX93kUCgYEAuX684hTz0Xz5N5Hv/28j\n/bMFWSf70+aLdUieSDEvJrq+ZErfDKayc7dl6XaZ48XCD8NeQguMP6tSthG4MuPW\n5Ldtz4L07M1wRxcgfMUHAy1dbloTl2hzK9HmnpvD4kGFmg61jxfTijzIupuXI0XH\nUSIvyS1IfRCq66ce9TBlIPkCgYBibxxMpMO2kD248H+7W7V4dka6RPijsUIcUMmW\n/Z71qR8Q/xQLmA3O2XMqZKKI1chbMakkDarVlkVvGrZLW4L2AS9s+Z4jLyFO6cYc\nMrMeqT0+bz/BGc8ZjgYHM+bOz11bpDBgFk1DJ1AfDUqpH+MJbZoOhDPyYpXuNCLk\nBnMNqQKBgQCeK5lbtD9XBrd9yPgQBphhalIVvBhLEQcyKAENLMRJX7V8fIXx3/n1\nKzQ4IspAXstSkBGojkUolp+Ym8JSSp4zddnLK7pvjDLHWpiYtIdHOf1/jcFt/YdT\n+l4sIouV5y8PNk6MdtJVc/dOwXK5DimLBqHYnTidgQnCHKUsKUKpyA==\n-----END RSA PRIVATE KEY-----"
+  }
+}
+
+3. Fix  ScheduleGet command's respond without   name.
+4. Allocate more storage space to schedule and alarm.
+
+More detail, please refer to  Api doc .
+
+Version 0.6.0 update:
+1. Remove certs from the OTA firmware, so that this version can be used for all devices, but must be upgraded based on 0.5.15 and above.
+Note: This version will read certs from store,it the Previous version doesn't store certs, your device won't work while running this version. 

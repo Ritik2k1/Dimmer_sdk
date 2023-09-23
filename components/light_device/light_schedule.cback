@@ -1,0 +1,2269 @@
+/*
+ * @Author: sky
+ * @Date: 2020-03-09 18:34:28
+ * @LastEditTime: 2020-03-09 18:53:03
+ * @LastEditors: Please set LastEditors
+ * @Description: ota
+ * @FilePath: \mqtt_example\components\light_device\_LIGHT_SCHEDULE_H.c
+ */
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+#include <string.h>
+#include <stdlib.h>
+#include "cJSON.h"
+
+#include "mwifi.h"
+#include "mupgrade.h"
+#include "mlink.h"
+
+#include "utlis.h"
+#include "event_queue.h"
+#include "light_schedule.h"
+#include "light_device.h"
+
+#define _BYTE_SECOND	(10000000)
+#define _BYTE_FUNCTION	(100)
+#define _WEEK_TIME_GET(t, zone)	( ( t + (zone * 3600)) % 86400 )
+
+#ifndef DIFF
+#define DIFF(a,b)  (( (a) > (b) )?( (a) - (b) ):( (b)- (a) ))
+#endif
+
+/***********************************************************************************************
+** tap, arm 在 flash 中储存的结构，数据的存储使用esp32 中的 key-value 进行保存和寻找。
+** "schedule_nums"  中保存了当前设备有多少个 tap, alarm 以及最近一次的读取位置
+**					结构如下：
+**				typedef struct	{
+			            Sch_had_t  p_had[ _SCH_CMD_MAX ];
+			            uint8_t read_position[ _SCH_CMD_MAX ];
+			        }_SCH_CTL_T;
+**
+** "TC_TAP" 保存了当前所有 tap 信息的索引列表
+		 typedef struct SCH_LIST_T{
+            char p_sub_key[4];	// alarm key  默认是 Ala, tap 默认是 Tap
+            Item_t p_list[];
+                typedef struct ITEM_T{
+                    uint32_t idx;
+                    uint64_t sch_time_key;  // 索引
+                        "sch_time_key"
+                            {data}
+                }Item_t;
+        }Sch_List_t;
+	
+**  "TC_ALARM" 保存了当前所有 alarm 信息的索引列表
+		typedef struct SCH_LIST_T{
+			   char p_sub_key[4];  // alarm key  默认是 Ala, tap 默认是 Tap
+			   Item_t p_list[];
+				   typedef struct ITEM_T{
+					   uint32_t idx;
+					   uint64_t sch_time_key;  // 索引
+						   "sch_time_key"
+							   {data}
+				   }Item_t;
+		   }Sch_List_t;
+**	内容： "sch_time_key" 保存了该项的详细内容。
+**********************************/
+#define _PACKAGE_MAX_LEN	(1024)
+static const char *TAG          = "schedule"; 
+typedef struct SCHEDULE_HAD_T{
+	uint64_t time_id; // 0123456786400 =  1234567(星期) + 86400(日内时间) + 01 (00 代表 alarm)，11(tu) 12(td)13(dtu) ..
+
+	uint8_t bri;
+	uint8_t self;
+
+	uint16_t fade;
+	uint16_t coutdown_tm;
+	
+	uint8_t p_id[16];  // ？
+}Schedule_had_t;
+
+
+typedef struct SCHEDULE_T{
+
+	Schedule_had_t had;
+	uint16_t data_len;
+	uint8_t *p_data;
+}Sch_t;
+
+typedef struct SCHEDULE_FILE_T{
+
+	Schedule_had_t had;
+	uint16_t data_len;
+	uint8_t p_data[];
+}Sch_file_t;
+/*****
+******
+** 无论是 alarm 还是 tap，都有类似的结构，其实子结构也就那点东西，bri,fade,cuttime,以及控制其它灯或者是触发场景.
+** 但是 tab 和 alarm 又有一些自身的结构，所以这里劈开两部分储存一部分是共性的 Sch_file_t 结构，另一部分是 tab 或者
+** Alarm 自有特殊部分 Alarm_sub_t， Tap_sub_t。
+** alarm list 入口key 为 TC_ALARM; alarm 子结构 Sch_file_t 的key 为 00_time, Item_sub_t 的key 为 Ala_index
+** tab list 入口 key 为 TC_tabp; tab 子结构 Sch_file_t 的key 为 01_time "TU",11_time "TD",21_time "DTU",31_time "DTD"...
+********
+********/
+/***
+** alarm 总的入口为 Alarm_list_t 结构
+** 每一个 alarm 结构为 子项 sub 的 key 的index， 该index和关键字母 p_sub_key 结合可以找到Alarm_sub_t 的 value。
+** 每个 alarm 由两部分构成： Sch_file_t 储存 schedule 详细的信息，Alarm_sub_t 储存额外的信息，如名称等。
+******/
+typedef enum{
+	_SCH_TYPE_ALARM = 0,
+	_SCH_TYPE_TAP = 10,
+
+	_SCH_TYPE_MAX
+}_SCH_TYPE_T;
+
+typedef struct _SCH_SETTING_T{
+	uint8_t p_power[_SCH_TAP_MAX];
+	uint8_t p_bri[_SCH_TAP_MAX];
+	uint8_t p_dimmer[_SCH_TAP_MAX];
+
+	uint32_t p_fade[_SCH_TAP_MAX];
+	uint32_t cutdown;
+}_sch_setting_t;
+
+static _sch_setting_t sch_setting = {0};
+
+const char *_p_tap_type[_SCH_TAP_MAX] = {"TU","TD","DTU","DTD", NULL};
+
+typedef struct ITEM_T{
+	uint32_t idx;
+	//uint8_t sub_item;
+	uint64_t sch_time_key;
+}Item_t;
+
+// sub 储存 alarm 的 name.
+typedef struct ITEM_SUB_T{
+	uint8_t name_len;
+	char p_name[];
+}Item_sub_t;
+
+typedef struct TAPSCH_SUB_T{
+	uint8_t name_len;
+	char p_name[];
+}Tapsch_sub_t;
+
+typedef struct TAP_SUB_T{
+	uint8_t name_len;
+	uint64_t tap_items[8]; //  可以删掉.
+	char p_name[];
+}Tap_sub_t;
+
+typedef struct SCH_LIST_T{
+	char p_sub_key[4];	// alarm key  默认是 Ala, tap 默认是 Tap
+	Item_t p_list[];
+}Sch_List_t;
+
+typedef enum {
+	_SCH_CMD_ALAM,
+	_SCH_CMD_TAP,
+	
+	_SCH_CMD_MAX
+}_Sch_type_t;
+const char *_p_sch_key[_SCH_CMD_MAX] = {
+	"TC_ALARM",
+	"TC_TAP",
+	NULL
+};
+typedef struct SCH_HAD_T{
+	uint8_t nums;
+}Sch_had_t;
+typedef struct	{
+	
+	Sch_had_t  p_had[ _SCH_CMD_MAX ];
+	uint8_t read_position[ _SCH_CMD_MAX ];
+}_SCH_CTL_T;
+
+#define HMS2UNINT(str,num)  do{ \
+	int a=0,b=0,c=0;\
+	sscanf(str,"%d:%d:%d",&a,&b,&c);\
+	num = a*3600+b*60+c;\
+	}while(0)
+#define HMS2STRING(p_str, wtime) do{ int h = wtime / 3600, m= (wtime % 3600)/60, s= (wtime % 3600) % 60;\
+										sprintf(p_str, "%02d:%02d:%02d", h,m,s);}while(0)
+
+static uint64_t current_id[_SCH_CMD_MAX] = {0}, next_id[_SCH_CMD_MAX] = {0}, next_secend[_SCH_CMD_MAX] = {0};
+
+static Sch_file_t *p_sch_tap[_SCH_TAP_MAX] = {0};
+
+char *_w_day[7]={"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
+
+//Sch_had_t schd_had[ _SCH_CMD_MAX ];
+
+_SCH_CTL_T _ctl = {0};
+
+#define _SCH_FILE_LEN(p_sch)	( sizeof(Sch_file_t) + p_sch->data_len )
+
+
+static mdf_err_t _tap_sub_get(char **pp_tap, int *p_tap_len, uint64_t key_id, char **pp_error);
+static mdf_err_t _tapsch_sub_save(uint64_t id, char *p_json, char **pp_error);
+static mdf_err_t _tapsch_get_array_id(uint64_t *pp_id, int *p_len, char *p_src);
+static mdf_err_t _tapsch_del(_Sch_type_t type, int del_all, char **pp_respond , uint64_t *p_del_id, int del_len, char **pp_error);
+static void _sch_update(_Sch_type_t type);
+static mdf_err_t alarm_loop_detect(void *p_arg);
+static void _sch_tap_setting_update(uint64_t tid);
+
+/**
+** printf a file
+**/
+void _sch_file_printf(Sch_file_t *p_sch){
+
+	// printf time
+	MDF_LOGD("time id %llu\n", p_sch->had.time_id);
+
+	// bri
+	MDF_LOGD("bri %d\n", p_sch->had.bri);
+
+	// fade
+	MDF_LOGD("fade %d\n", p_sch->had.fade);
+	
+	// self
+	MDF_LOGD("self : %d\n", p_sch->had.self);
+	
+	// countdown_time
+	MDF_LOGD("coutdown time %d\n", p_sch->had.coutdown_tm);
+
+	if(p_sch->p_data){
+		MDF_LOGD("Additional len = %d : %s   \n", p_sch->data_len, p_sch->p_data);
+	}
+
+}
+static Sch_file_t *_sch_file_read_with_id(uint64_t id, int *p_len){
+	Sch_file_t *p_sch = NULL;
+	char p_key[32] = {0};
+
+	MDF_ERROR_GOTO( (0 == id), End, "sch id must not be zero\n");
+	sprintf(p_key, "%llu", id);
+	
+	MDF_LOGD("Get key %s \n", p_key);
+
+	p_sch = utlis_info_load(p_key, p_len);
+
+	if(p_sch){
+		MDF_LOGD("Successfully read key %s get %d byte \n", p_key, *p_len);
+	}
+End:
+	
+	return p_sch;
+}
+mdf_err_t _json2time_id(uint64_t *p_tm_index, const char *p_src){
+
+	mdf_err_t rc = MDF_FAIL;
+	uint32_t start_time = 0;
+	uint64_t tm_index = 0;
+	int i=0, j = 0;
+	uint8_t nums = 0;
+	char *p_start_tm = NULL, *p_week[7] = {NULL}, *p_start_time = NULL;
+
+	//MDF_LOGD("src data: %s\n", p_src);
+	// get start time.
+	mlink_json_parse(p_src, "StartTime", &p_start_tm);
+	MDF_ERROR_CHECK( NULL == p_start_tm,  MDF_FAIL, "Fait to get start time\n");
+
+	// get week.
+	rc = mlink_json_parse(p_src, "Days", &nums);
+	MDF_ERROR_GOTO(MDF_OK != rc, End , "Fait to get days\n");
+	// combination.
+
+	rc = mlink_json_parse(p_src, "Days", p_week);
+	MDF_ERROR_GOTO(MDF_OK != rc, End , "Fait to get days\n");
+	for(i=0; i< nums; i++){
+		for(j=0;j<7;j++){
+			if(!strcasecmp(p_week[i], _w_day[j]))
+			{
+				tm_index += (j == 0)?1: utils_pow(10, j);
+				//MDF_LOGD("week %d, out %llu \n", j, tm_index);
+				MDF_FREE(p_week[i]);
+				p_week[i] = NULL;
+				rc = MDF_OK;
+				j = 0;
+			   break;
+			}
+		}
+		
+		MDF_FREE(p_week[i]);
+		p_week[i] = NULL;
+	}
+	// 012345678 week
+	//MDF_LOGD("get week %llu\n", tm_index);
+	// get day time  24 * 60 * 60 = 86400 所以 再需要前移 1000000 位
+	
+	mlink_json_parse(p_src, "StartTime", &p_start_time);
+	HMS2UNINT(p_start_time,  start_time);
+	tm_index *= (uint64_t) 100000;
+	tm_index += start_time;
+	//MDF_LOGD("get week + time %llu\n", tm_index);
+	*p_tm_index = tm_index;
+	
+End:
+	
+	MDF_FREE(p_start_time);
+	MDF_FREE(p_start_tm);
+	return rc;
+}
+
+// 1. json 转 struct 结构.
+/***
+{
+  "start_time": "05:00:00",
+  "days": ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"  ],
+  "countdown": "00:00:00",
+  "name": "Morning",
+  "brightness": 100,
+  "self": 1,
+  "fade": 1.2,
+  "additional": {...}
+}
+****/
+static mdf_err_t sch_json2struct(uint64_t id, Sch_file_t **pp_sch, char **pp_error, const char *p_src){
+	Sch_file_t *p_sch = NULL;
+	char *p_additional = NULL, *p_countdown = NULL;
+	int additional_len = 0;
+	float fade = 0;
+
+	MDF_PARAM_CHECK(p_src);
+
+	if(  mlink_json_parse(p_src, "Additional", &p_additional) == MDF_OK && NULL != p_additional ){
+		additional_len = strlen( p_additional );
+	}
+	
+	p_sch = ( Sch_file_t *) utlis_malloc( sizeof( Sch_file_t ) + additional_len + 8 );
+	MDF_ERROR_GOTO( NULL == p_sch, Error_End, "Endto malloc \n");
+	if( p_additional && additional_len > 0 ){
+		memcpy(p_sch->p_data, p_additional,  additional_len);
+		p_sch->data_len =  additional_len;
+	}
+	
+	if(id == 0){
+		mdf_err_t rc = _json2time_id(&p_sch->had.time_id, p_src);
+		
+		MDF_ERROR_GOTO( MDF_OK != rc &&( *pp_error = (char *)malloc_copy_str("Failt to get Time"),1), \
+			Error_End, "Fait to get timeId \n");
+		MDF_LOGW("rc = %d \n", rc);
+	}else p_sch->had.time_id = id;
+	
+	mlink_json_parse( p_src, "Brightness", &p_sch->had.bri);
+	
+	if(MDF_OK ==  mlink_json_parse( p_src, "Fade", &fade) ){
+		p_sch->had.fade = fade * 1000;
+	}
+	
+	mlink_json_parse( p_src, "Self", &p_sch->had.self);
+
+	// get Countdown time 
+	mlink_json_parse( p_src, "Countdown", &p_countdown);
+
+	if( p_countdown ){
+		HMS2UNINT( p_countdown, p_sch->had.coutdown_tm);
+		MDF_FREE( p_countdown );
+		p_countdown = NULL;
+	}
+
+	*pp_sch =  p_sch;
+	
+	MDF_FREE(p_additional);
+	// todo debug.
+	//_sch_file_printf(p_sch);
+
+	return MDF_OK;
+	
+Error_End:
+
+	MDF_FREE(p_sch);
+	MDF_FREE(p_additional);
+	MDF_FREE(p_countdown);
+	
+	return MDF_FAIL;
+}
+static mdf_err_t _alarm_json2struct_alloc(const char *p_src, Sch_file_t **pp_sch, Item_sub_t **pp_sub)
+{
+	mdf_err_t rc = MDF_FAIL;
+	Item_sub_t *p_sub = NULL;
+	Sch_file_t *p_sch = NULL;
+	char *p_additional = NULL, *p_countdown = NULL, *p_name = NULL;
+	int additional_len = 0;
+	float fade = 0;
+
+	if(  mlink_json_parse(p_src, "Additional", &p_additional) == MDF_OK && NULL != p_additional ){
+		additional_len = strlen( p_additional );
+	}
+
+	p_sch = ( Sch_file_t *) utlis_malloc( sizeof( Sch_file_t ) + additional_len + 8 );
+	MDF_ERROR_GOTO( NULL == p_sch, Error_End, "Failt to malloc \n");
+
+	// add additional 
+	p_sch->data_len = additional_len;
+	memcpy((char *) p_sch->p_data, p_additional, additional_len);
+
+	// 计算 时间序列
+	rc = _json2time_id( &p_sch->had.time_id,  p_src);
+	MDF_ERROR_GOTO( rc != MDF_OK , Error_End, "Failt to get week days\n");
+
+	MDF_LOGD("time id %llu \n", p_sch->had.time_id);
+	
+	// 写入类型到时间序列
+	p_sch->had.time_id *=100;
+	
+	MDF_LOGD("time id %llu \n", p_sch->had.time_id);
+	p_sch->had.time_id +=_SCH_TYPE_ALARM;
+
+
+	MDF_LOGD("time id %llu \n", p_sch->had.time_id);
+	// get bri
+	rc = mlink_json_parse(p_src, "Brightness", &p_sch->had.bri );
+	MDF_ERROR_GOTO(rc != MDF_OK, Error_End, "Failt to get bri\n");
+
+	// get fade 
+	rc = mlink_json_parse(p_src, "Fade", &fade );
+	MDF_ERROR_GOTO( rc != MDF_OK, Error_End, "Failt to get fade \n");
+	p_sch->had.fade = (uint16_t)(fade * 1000); // change to ms.
+	// ge  cut down time 
+	rc = mlink_json_parse(p_src, "Countdown", &p_countdown);
+	if(p_countdown){
+		
+		HMS2UNINT(p_countdown, p_sch->had.coutdown_tm);
+		MDF_FREE(p_countdown);
+	}
+	
+	mlink_json_parse(p_src, "Self", &p_sch->had.self);
+
+	*pp_sch = p_sch;
+	
+	mlink_json_parse(p_src, "Name",  &p_name);
+	if(p_name){
+		int len = sizeof(Item_sub_t) + strlen(p_name) + 4;
+		p_sub = (Item_sub_t *)MDF_MALLOC( len );
+		MDF_ERROR_GOTO(NULL ==  p_sub, Error_End, "Failt to alloc \n");
+		memset(p_sub, 0, len);
+		memcpy(p_sub->p_name, p_name, strlen(p_name));
+		p_sub->name_len =  len;
+		MDF_FREE(p_name);
+		p_name = NULL;
+		*pp_sub = p_sub;
+	}
+	
+	MDF_FREE( p_additional );
+	return rc;
+
+Error_End:
+
+	MDF_FREE( p_sch );
+	MDF_FREE( p_additional );
+
+	return rc;
+}
+
+static inline mdf_err_t _sch_file_check(Sch_file_t *p_sch){
+
+	MDF_PARAM_CHECK(p_sch);
+	MDF_PARAM_CHECK(p_sch->had.time_id > 999999);
+
+	return MDF_OK;
+}
+// 把 schedule 写入 flash里.
+// 1.计算 key
+// 2.写入
+static mdf_err_t _sch_save(Sch_file_t *p_sch){
+	mdf_err_t rc = MDF_FAIL;
+	char p_key[32] = {0};
+
+	MDF_PARAM_CHECK(MDF_OK == _sch_file_check(p_sch) );
+
+	// todo debug 
+	//_sch_file_printf(p_sch);
+	
+	sprintf(p_key, "%llu", p_sch->had.time_id);
+	
+	rc = mdf_info_save(p_key, p_sch, _SCH_FILE_LEN(p_sch)  );
+
+	MDF_LOGD("save data to flash key = %s rc = %d\n", p_key, rc);
+
+	return rc;
+}
+static mdf_err_t _sch_weektime2json(char **pp_json, uint64_t time_id){
+	
+	
+	return MDF_OK;
+}
+/*********************
+**
+  {"StartTime": "05:00",
+  	"id":xxx,
+   "Days": ["Mon","Tue","Wed","Thu","Fri"]
+  }
+**
+*****************/ 
+static mdf_err_t _sch_starttime2json(char **pp_json, uint64_t tid){
+
+	char p_tmp[128] = {0}, *p_w  = NULL;
+	uint64_t start_tm = 0, week_tm = 0;
+	int i;
+
+	MDF_PARAM_CHECK(tid > 0);
+	MDF_PARAM_CHECK( pp_json );
+
+	// 0123456786400 =  1234567(星期) + 86400(日内时间) + 01 (00 代表 alarm)，11(tu) 12(td)13(dtu) ..
+	start_tm = (tid / 100) %100000;
+	MDF_LOGD("tid %llu \n", start_tm);
+
+	sprintf(p_tmp, "%llu", tid);	
+	mlink_json_pack(pp_json, "id", p_tmp);
+	
+	memset(p_tmp, 0, 128);
+	HMS2STRING( p_tmp, start_tm);
+	mlink_json_pack( pp_json, "StartTime", p_tmp);
+	memset(p_tmp, 0, 128);
+
+	// week.
+	week_tm = tid / 10000000;
+	MDF_LOGD("week %llu \n", week_tm);
+	
+	p_w = p_tmp;
+	p_w[0]='[';
+	p_w++;
+	
+	for(i =0; i< 7;i++){
+		if( ( week_tm %10) > 0 ){
+			if( strlen(p_tmp) > 3 ){
+				*p_w = ',';
+				p_w += 1;
+			}
+
+			*p_w='\"';
+			p_w++;
+			memcpy(p_w, _w_day[i], strlen( _w_day[i]) );
+			p_w += strlen(_w_day[i]);
+			*p_w='\"'; 
+			p_w++;
+			//MDF_LOGD("Week string %s \n", p_tmp);
+		}
+		week_tm = week_tm/10;
+		//MDF_LOGD("week_tm %llu \n", week_tm);
+		if(week_tm == 0)
+			break;
+	}
+
+	*p_w = ']';
+	MDF_LOGD("week string %s\n ", p_tmp);
+	mlink_json_pack( pp_json, "Days", p_tmp);
+
+	return MDF_OK;
+}
+static mdf_err_t _sch_struct2json(char **pp_json , Sch_file_t *p_sch, int parse_week_time){
+
+	mdf_err_t rc = MDF_OK;
+	double fade = 0;
+	char p_tmp[64] = {0};
+	MDF_PARAM_CHECK(pp_json);
+	MDF_PARAM_CHECK(p_sch);
+
+	
+	// todo 
+	//sprintf(p_tmp, "%llu", p_sch->had.time_id );
+	//rc = mlink_json_pack(pp_json, "TimeId", p_tmp );
+	if(parse_week_time)
+		_sch_starttime2json(pp_json, p_sch->had.time_id);
+
+	rc = mlink_json_pack(pp_json, "Brightness", p_sch->had.bri);
+	rc = mlink_json_pack(pp_json, "Self", p_sch->had.self);
+	
+	fade = p_sch->had.fade / 1000.0;
+	rc = mlink_json_pack_double(pp_json, "Fade", fade);
+	
+	// rc = mlink_json_pack(pp_json, "Fade", p_sch->had.fade);
+	memset(p_tmp, 0, 64);
+	HMS2STRING(p_tmp, p_sch->had.coutdown_tm);
+	rc = mlink_json_pack(pp_json, "Coutdown", p_tmp);
+
+	if(p_sch->p_data && p_sch->data_len > 0){
+		char *p_data = (char *)p_sch->p_data;
+		rc = mlink_json_pack(pp_json, "Additional", p_data);
+	}
+	if(*pp_json)
+		MDF_LOGD("sch file to  json %s \n",  *pp_json );
+
+	return rc;
+}
+/****************
+// 1. 解析转换成 struct,并解析出该 alarm 的 id= 3123456786400
+// 2. 写入 3123456786400-Sch_file_t.
+// 3 向"Alarm_list" 添加 "3123456786400" 记录
+** alarm 结构：Alarm_list 收录所有 alarm 条目，在计算下一个 alarm，删除单个或所有 alarm时用到，是alarm 的总入口.
+
+key:Alarm_list
+value:{ uint8_t numbers; uint64_t p_item[]  }
+注意其 value 的结构是 { uint8_t numbers; uint64_t p_item[]  }
+
+************/
+#if 0
+static mdf_err_t _alarm_list_add( Sch_file_t *p_sch, void *p_data){
+	// 获取当前 alarm list.
+	// 添加到末尾.添加 sub 子选项.
+
+	mdf_err_t rc = MDF_OK;
+	Sch_List_t *p_list = NULL;
+	if(mdf_info_load("TC_ALARM", p_list, len))
+	
+}
+#endif
+static void _ctl_nums_increase(_Sch_type_t cmd){
+	_ctl.p_had[cmd].nums++;
+	
+	mdf_info_save("schedule_nums",	&_ctl.p_had , ( sizeof(Sch_had_t) *  _SCH_CMD_MAX) );
+}
+static void _ctl_nums_decrease(_Sch_type_t cmd){
+	_ctl.p_had[cmd].nums = ( _ctl.p_had[cmd].nums == 0)?0:(_ctl.p_had[cmd].nums -1);
+	mdf_info_save("schedule_nums",	&_ctl.p_had , ( sizeof(Sch_had_t) *  _SCH_CMD_MAX) );
+}
+
+static inline int _ctl_nums_get(_Sch_type_t cmd){
+	return _ctl.p_had[cmd].nums;
+}
+static inline uint8_t _ctl_position_get(_Sch_type_t type){
+	return _ctl.read_position[type];
+}
+static inline void _ctl_position_set(_Sch_type_t type, uint8_t position){
+	//MDF_LOGE("Position set %d  to %d \n", type, position);
+	_ctl.read_position[type] = position;
+
+}
+
+static mdf_err_t _item_sub_add_save(_Sch_type_t stype, int index, const char *p_src){
+	mdf_err_t rc = MDF_FAIL;
+	char p_key_str[32] = {0}, *p_name = NULL;
+	
+	MDF_PARAM_CHECK( p_src);
+	MDF_PARAM_CHECK( stype < _SCH_CMD_MAX);
+
+	mlink_json_parse(p_src, "name", &p_name);
+
+	if( p_name && strlen( p_name) > 0 ){
+
+		Item_sub_t *p_sub = utlis_malloc( sizeof( Item_sub_t ) + strlen( p_name) +1);
+		MDF_ERROR_GOTO( NULL == p_sub, End, "Failt to Alloc\n");
+		p_sub->name_len = strlen( p_name);
+		memcpy(p_sub->p_name, p_name, p_sub->name_len);
+		
+		sprintf(p_key_str, "%s_%d",_p_sch_key[stype], index );
+		mdf_info_save( p_key_str,  p_sub, sizeof( Item_sub_t ) + p_sub->name_len );
+
+		MDF_LOGD("Add sub item %s to key %s \n", p_sub->p_name, p_key_str);
+		MDF_FREE(p_sub);
+		p_sub = NULL;
+	}
+	
+	rc = MDF_OK; 
+End:
+
+	MDF_FREE(p_name);
+	
+	return rc;
+}
+static mdf_err_t item_sub_del(_Sch_type_t stype, int index){
+	mdf_err_t rc = MDF_FAIL;
+	char p_key_str[32] = {0};
+
+	MDF_PARAM_CHECK( stype < _SCH_CMD_MAX);
+	
+	sprintf(p_key_str, "%s_%d", _p_sch_key[stype], index );
+	rc = mdf_info_erase( p_key_str);
+	
+	return rc;
+}
+static mdf_err_t item_sub_json_get(char **pp_json, _Sch_type_t stype, Item_t *p_item){
+	mdf_err_t rc = MDF_FAIL;
+	int len = 0;
+	char p_key[32] = {0};
+	Item_sub_t *p_sub = NULL;
+
+	sprintf(p_key, "%s_%d", _p_sch_key[stype], p_item->idx);
+
+	p_sub = utlis_info_load(p_key, &len);
+	MDF_ERROR_CHECK( NULL == p_sub, MDF_FAIL, "Failt to read sub item\n");
+
+	if(p_sub->name_len > 0)
+		rc = mlink_json_pack(pp_json, "name", p_sub->p_name);
+
+	MDF_FREE(p_sub);
+	
+	return rc;
+}
+
+static Sch_List_t *_sch_List_t_get(_Sch_type_t type){
+
+	mdf_err_t rc = MDF_OK;
+	Sch_List_t *p_sch = NULL;
+	
+	int rlen = sizeof(Sch_List_t) + (  _ctl_nums_get(type) * sizeof( Item_t) ) ;
+
+	p_sch= utlis_malloc(rlen);
+	MDF_ERROR_GOTO( NULL == p_sch, End, "Failt to alloc\n");
+	rc = mdf_info_load( _p_sch_key[type], p_sch, rlen);
+	if(rc != MDF_OK){
+		MDF_LOGW("Failt to get %s from flash\n", _p_sch_key[type] );
+	}
+	
+End:
+	return p_sch;
+}
+static int _sch_list_add_save( _Sch_type_t stype, uint64_t tm_key){
+
+	mdf_err_t rc = MDF_OK;
+	Sch_List_t *p_sch_list = NULL;
+	Item_t *p_find = NULL;
+	int idx = -1;
+	int rlen = 0, wlen = 0, nums = _ctl_nums_get(stype), i =0;
+	
+	rlen = sizeof(Sch_List_t)  + ( nums * sizeof(Item_t) );
+	wlen = rlen + sizeof(Item_t);
+	p_sch_list = (Sch_List_t *) utlis_malloc( wlen );
+
+	if( nums > 0 ){
+		Sch_List_t *p_sch_read = NULL;
+		p_sch_read = _sch_List_t_get(stype);
+		//rc = mdf_info_load( _p_sch_key[stype] , p_sch_list, strlen( _p_sch_key[stype] ) );
+		MDF_ERROR_GOTO( NULL == p_sch_read , End, "Faitl to get %s\n", _p_sch_key[stype] );
+		memcpy( p_sch_list, p_sch_read, rlen);
+		MDF_FREE(p_sch_read);
+	}
+
+	for(i=0;i< nums; i++){
+		if(   p_sch_list->p_list[i].sch_time_key == tm_key  ){
+			p_find = &p_sch_list->p_list[i];
+			MDF_LOGD("modify schedule %llu\n", p_find->sch_time_key);
+			break;
+		}
+	}
+	
+	// new one and try to add to the end of array.
+	if(p_find == NULL){
+		p_sch_list->p_list[nums].idx = nums +1;
+		p_sch_list->p_list[nums].sch_time_key = tm_key;
+		_ctl_nums_increase(stype);
+		p_find = &p_sch_list->p_list[nums];
+		
+		MDF_LOGD("Add schedule %llu  to %s successfully \n", p_find->sch_time_key, _p_sch_key[stype]);
+
+		rc = mdf_info_save( _p_sch_key[stype], p_sch_list, (size_t) wlen );
+		if(rc != MDF_OK){
+			_ctl_nums_decrease(stype);
+			goto End;
+		}
+	}
+
+	idx = p_find->idx;	
+End:
+
+	MDF_FREE(p_sch_list);
+	return idx;
+}
+
+static mdf_err_t _sch_list_remove(_Sch_type_t type, uint64_t del_id){
+	Sch_List_t  *p_list = _sch_List_t_get(type);
+
+	if(p_list){
+		int i =0, nums = _ctl_nums_get(type), wlen = 0;
+		
+		for( i=0; i< nums; i++){
+			
+			MDF_LOGD("del id %llu  src id %llu \n", del_id, p_list->p_list[i].sch_time_key);
+			 if( p_list->p_list[i].sch_time_key == del_id ){
+			 	
+			 	MDF_LOGI("Remove %llu \n", del_id);
+
+				if( i <  (nums -1) ){
+					memcpy(&p_list->p_list[i], &p_list->p_list[nums-1], sizeof( Item_t ) );
+				}
+				break;
+			 }
+		}
+
+		wlen = sizeof(Sch_List_t)  + ( (nums -1 ) * sizeof(Item_t) );
+
+		if( MDF_OK ==  mdf_info_save( _p_sch_key[type], p_list, (size_t) wlen ) ){
+			MDF_LOGE("save modify  %s \n", _p_sch_key[type]);
+			_ctl_nums_decrease(type);
+			return MDF_OK;
+		}
+		
+	}
+	return MDF_FAIL;
+}
+/**
+** 构造 tap 结构. 
+{
+"Self": true,
+"Brightness": 100,
+"Fade": 0.5,
+"Countdown": "00:00:00",
+"Additional": {
+  "UseThisBrightness": xxx
+}
+}
+
+*****/
+static mdf_err_t _alarm_sub_get(char **pp_alarm, int *p_tap_len, uint64_t key_id, char **pp_error){
+
+	// get list 
+	double fade_d = 0;
+	mdf_err_t rc = MDF_FAIL;
+	Sch_file_t *p_sf = NULL;
+	int sch_len = 0;
+	MDF_PARAM_CHECK(pp_alarm);
+	MDF_PARAM_CHECK(p_tap_len);
+	
+	p_sf = _sch_file_read_with_id( key_id,  &sch_len);
+	MDF_ERROR_CHECK( (NULL == p_sf &&(*pp_error =(char *) malloc_copy_str( "Failt to read schedule file" ), 1) ), 
+		MDF_FAIL, "Failt to read schedule file \n");
+
+	MDF_LOGD("_tap_sub_get \n");
+
+	//_sch_file_printf(p_sf);
+	// struct to json 
+	rc = _sch_struct2json(pp_alarm, p_sf, 0);
+
+	if(*pp_alarm)
+		MDF_LOGD("json %s \n", *pp_alarm);
+
+	MDF_FREE( p_sf );
+	p_sf = NULL;
+	
+	return rc;
+}
+
+/***
+** 按照 读取 index 获取一项 alarm json.
+** 1. 获取 alarm tab.
+** 2. 根据 tab 解析并从 flash 中获取各项.
+** 3. 组合成 json.
+*******/
+/**
+** 构造 tap 结构.
+"alarm get": 
+{"id":xx, "time":xx}
+*****/
+static mdf_err_t _arlarm_single_get(char **pp_tap, int *p_tap_len, Item_t *p_item, char **pp_error){
+
+	// get list 
+	int64_t t_id = 0;
+	mdf_err_t rc = 0;
+	char *p_json = NULL;
+	
+	int i =0, json_len =0;
+	
+	t_id = p_item->sch_time_key;
+	_alarm_sub_get( &p_json, &json_len, t_id, pp_error );
+	if(p_json){
+		_sch_starttime2json(&p_json, t_id);
+
+	}else{
+		if(NULL == pp_error)
+			*pp_error = (char *)malloc_copy_str("Failt to get tap json");
+
+		MDF_LOGW( "Failt  \n");
+		MDF_FREE(p_json);
+		return MDF_FAIL;
+	}
+
+	MDF_LOGI("Tap json %s\n", p_json);
+
+	*pp_tap = p_json;
+	*p_tap_len = strlen(p_json);
+
+	MDF_LOGD("len  = %d\n", *p_json);
+	return rc;
+
+}
+
+// 输出 [ {alarm1},{alarm2},{alarm3},{alarm4}]
+static mdf_err_t _alarm_get(char **pp_taps, char **pp_error){
+
+	int i=0, total_len =0, new_len = 0, nums = 0;
+	char *p_taps = NULL, *p_new = NULL;
+	
+	Sch_List_t *p_sch_list = NULL;
+	
+	p_sch_list = _sch_List_t_get( _SCH_CMD_ALAM );
+
+	MDF_ERROR_CHECK( NULL == p_sch_list && ( *pp_error = (char *)malloc_copy_str("Failt read alarm"), 1 ) ,
+		MDF_FAIL, "Failt read alarm \n");
+
+	nums = _ctl_nums_get( _SCH_CMD_ALAM );
+	
+	MDF_LOGD("Device have %d \n", nums);
+	new_len = 4;
+	p_taps = utlis_malloc( new_len );
+	MDF_ERROR_CHECK( NULL == p_taps && ( *pp_error = (char *)malloc_copy_str("Failt to alloc"), 1 ) ,
+		MDF_FAIL, "Failt to alloc\n");
+	
+	p_taps[0]='['; 
+	total_len = 1;
+	for( i=0;i< nums; i++ ){
+
+		if(i <_ctl_position_get( _SCH_CMD_ALAM ) ){
+			MDF_LOGI("skip %d\n", i);
+			continue;
+		}
+		
+		// p_new = "Alarm": [{"head":xx},{""}]
+		_arlarm_single_get(&p_new, &new_len, &p_sch_list->p_list[i], pp_error);
+		
+		// error happend.
+		if( *pp_error || (p_new == NULL || 0 == new_len) ){
+			_ctl_position_set( _SCH_CMD_ALAM, 0);
+			
+			MDF_LOGW("error \n");
+			if(*pp_error)
+				MDF_LOGW("Error: %s\n", *pp_error);
+			
+			MDF_FREE(p_taps);
+			p_taps = NULL;
+			break;
+		}
+
+		MDF_LOGD("get json %s \n", p_new);
+		
+		if( ( total_len + new_len ) > _PACKAGE_MAX_LEN ){
+			//i -=1;
+			MDF_LOGE("Free p_new \n");
+			MDF_FREE(p_new);
+			p_new = NULL;
+			new_len = 0;
+			break;
+		}
+		MDF_LOGI("get sub  schedule %s\n ", p_new);
+		
+		total_len += new_len + 2;
+
+		MDF_LOGD( "tap len = %d, new len = %d \n", strlen( p_taps ), strlen( p_new ) );
+		MDF_LOGD("total len = %d\n", total_len);
+		p_taps = MDF_REALLOC(p_taps ,  total_len );
+		
+		if(p_taps){
+			int olen = strlen(p_taps);
+			
+			if(olen > 10){
+				p_taps[olen] = ',';
+				p_taps[olen + 1 ] = '\0';
+			}
+			strcat( p_taps, p_new );
+			MDF_LOGI("get alarm %s\n ", p_taps);
+
+		}else{
+			MDF_LOGE("Failt to realloc \n");
+		}
+
+		MDF_FREE( p_new );
+		p_new = NULL;
+		new_len = 0 ;
+	}
+	if(   p_taps ){
+
+		total_len = strlen(p_taps) + 2;
+		
+		MDF_LOGI("get tap schedule %s\n ", p_taps);
+		MDF_LOGD("total len = %d\n", total_len);
+
+		p_taps = MDF_REALLOC( p_taps,  total_len );
+		
+		if(p_taps){
+			
+			int Remaining  = 0;
+			p_taps[ total_len - 2 ] = ']';
+			p_taps[ total_len -1 ] = '\0';	
+
+			
+			i = (i >= nums)?nums:i;
+			Remaining = nums - i;
+			_ctl_position_set( _SCH_CMD_ALAM, i);
+			MDF_LOGI("get tap schedule %s\n ", p_taps);
+			
+			mlink_json_pack(pp_taps, "Alarms",  p_taps );
+			mlink_json_pack(pp_taps, "Remaining",  Remaining);
+			MDF_FREE( p_taps );
+			p_taps = NULL;
+			
+		}else{
+			MDF_LOGE("Failt to alloc \n");
+		}
+	
+	}
+
+	MDF_FREE(p_new);
+	return MDF_OK;
+}
+static mdf_err_t _alarm_set( uint64_t *p_id, const uint8_t *p_src, char **pp_error){
+	int idx = 0;
+	mdf_err_t rc = MDF_OK;
+	uint64_t id = 0;
+
+	
+	rc = _json2time_id(&id, (const char *)p_src);
+	id *= 100;
+	id += _SCH_TYPE_ALARM;
+	// save sub ... 
+	idx = _sch_list_add_save( _SCH_CMD_ALAM, id);
+	MDF_ERROR_GOTO( -1 == idx &&( *pp_error = (char *)malloc_copy_str("Failt to add to flash!") , 1), \
+		End, "Failt to add to flash.\n");
+	
+	rc = _item_sub_add_save(_SCH_CMD_ALAM, idx, (char *)p_src);
+	rc = _tapsch_sub_save(id, (char *)p_src, pp_error);
+	*p_id = id;
+End:
+	return rc;
+}
+
+// 设置 alram
+// 1. 获取 arlarm json
+// 2. 解析json 转换为 struct
+// 3. 把 struct 保存到 flash
+// 4. 回应 服务器.
+mdf_err_t mlink_alarm_set(mlink_handle_data_t        *p_mdata )
+{
+	mdf_err_t rc = MDF_OK;
+	char *p_data = NULL, *p_rep = NULL, *p_error = NULL;
+	int status_code = 300;
+	uint64_t id = 0;
+	
+	MDF_PARAM_CHECK(p_mdata);
+	MDF_PARAM_CHECK(p_mdata->req_data);
+
+	MDF_LOGD("alarm set get %s\n", p_mdata->req_data);
+
+	// get data
+	rc = mlink_json_parse( p_mdata->req_data, "data",  &p_data);
+	MDF_ERROR_GOTO( ( NULL == p_data && ( p_rep =(char *)malloc_copy_str("Failt Not data\n"), 1) ) , \
+		End_Respond, "Failt Not data\n");
+
+		
+	rc = _alarm_set( &id, (uint8_t *)p_data, &p_error);
+	
+	if( MDF_OK == rc)
+		_sch_update(_SCH_CMD_ALAM);
+
+	if(  p_error ){
+		status_code = 300;
+		p_rep = p_error;
+	}else {
+		
+		char p_tmp[32] = {0};
+		sprintf(p_tmp, "%llu", id);
+		rc = mlink_json_pack( &p_rep, "id", p_tmp);
+		status_code = 200;
+
+		MDF_LOGE("respond %s \n", p_rep);
+	}
+
+End_Respond:
+
+	rc = mevt_command_respond_creat( (char *)p_mdata->req_data, status_code, p_rep);
+
+	MDF_FREE(p_data);
+	MDF_FREE(p_rep);
+	return rc;
+}
+/***
+** 接收到 
+"data": {
+    "method": "alarm_get",
+    "from_beginning": 1
+  }
+*******************/
+mdf_err_t mlink_alarm_get(mlink_handle_data_t        *p_mdata )
+{
+	mdf_err_t rc = MDF_FAIL;
+	int status_code = 300, begin = 0;
+	char *p_tap = NULL, *p_error = NULL, *p_respond = NULL, *p_data = NULL;
+
+	MDF_PARAM_CHECK(p_mdata);
+	MDF_PARAM_CHECK(p_mdata->req_data);
+
+	MDF_LOGD("Receive %s \n", p_mdata->req_data);
+
+	mlink_json_parse(p_mdata->req_data, "data", &p_data);
+
+	if(p_data){
+		
+		mlink_json_parse(p_data, "begin", &begin);
+		MDF_LOGD("begin %d \n", begin);
+
+		if(begin)
+			_ctl_position_set( _SCH_CMD_ALAM, 0);
+
+		MDF_FREE(p_data);
+		p_data = NULL;
+	}
+	
+	rc = _alarm_get(&p_tap, &p_error);
+	
+	if( p_error ){
+		status_code = 300;
+		MDF_FREE(p_tap);
+		p_tap = NULL;
+		p_respond = p_error;
+	}else {
+		status_code = 200;
+		p_respond = p_tap;
+	}
+	rc = mevt_command_respond_creat( (char *)p_mdata->req_data, status_code, p_respond);
+	
+	MDF_FREE( p_tap );
+	MDF_FREE( p_error );
+	
+	return rc;
+}
+
+mdf_err_t mlink_alarm_del(mlink_handle_data_t        *p_mdata )
+{
+	mdf_err_t rc = MDF_FAIL;
+	int all = 0, status_code = 300, id_len = 0;
+	uint64_t *p_array = NULL;
+	char  *p_error = NULL, *p_respond = NULL, *p_data = NULL;
+
+	MDF_PARAM_CHECK( p_mdata );
+	MDF_PARAM_CHECK( p_mdata->req_data );
+	
+	MDF_LOGW( "mlink_schedule_del src %s \n", p_mdata->req_data);
+
+	// get data 
+	mlink_json_parse( p_mdata->req_data, "data", &p_data);
+	
+	MDF_ERROR_GOTO( NULL == p_data && (p_error = (char*)malloc_copy_str("Failt to get data from json" ), 1), \
+		End, "Failt to get data from json \n");
+	
+	// get del
+	mlink_json_parse( p_data, "All", &all );
+	// 
+	_tapsch_get_array_id(&p_array, &id_len, p_data);
+
+	if( all > 0 || ( p_array && id_len > 0) ){
+		_tapsch_del(_SCH_CMD_ALAM, all, &p_respond, p_array, id_len, &p_error);
+	}else{
+		p_error = (char *) malloc_copy_str("Can't find All or TapSchedule.");
+	}
+	
+End:
+
+	if( p_error ){
+		
+		status_code = 300;
+		MDF_FREE(p_respond);
+		p_respond = p_error;
+
+	}else {
+		status_code = 200;
+	}
+
+	rc = mevt_command_respond_creat( (char *)p_mdata->req_data, status_code, p_respond);
+	
+	MDF_FREE( p_respond );
+	MDF_FREE( p_error );
+
+	return rc;
+
+}
+/**
+** 1. 对 json 转换 为 struct 并保存.
+**/
+static mdf_err_t _tapsch_sub_save(uint64_t id, char *p_json, char **pp_error)
+{
+	mdf_err_t rc = 0;
+	Sch_file_t *p_sch_f  = NULL;
+	
+	//MDF_LOGD("tap Add %llu to flash\n", id);
+	rc = sch_json2struct( id, &p_sch_f, pp_error, p_json);
+
+	MDF_ERROR_CHECK( ( *pp_error !=NULL || NULL == p_sch_f ), rc, "Failt to save sub taps\n");
+	//_sch_file_printf( p_sch_f );
+
+	rc = _sch_save( p_sch_f );
+	MDF_FREE(p_sch_f);
+	p_sch_f = NULL;
+	return rc;
+}
+/***
+源 json:
+{
+	"name":xx,
+	"time":xx,
+	"taps"{"tu":{},"td":{}...}
+}
+// 1. 获取 schedule json
+// 2. 解析json 转换为 struct
+// 3. 把 struct 保存到 flash
+// 4. 回应 服务器.
+*******/
+static mdf_err_t _tapsch_single_set(char *p_json, uint64_t *p_id, char **pp_error){
+	mdf_err_t  rc =0;
+	uint64_t tap_id = 0, sub_id = 0;
+	int i = 0, idx = 0;
+	char *p_taps = NULL, *p_value = NULL;
+	// get time  id 
+	rc = _json2time_id(&tap_id, p_json);
+	MDF_ERROR_GOTO(rc != MDF_OK &&( *pp_error = (char *)malloc_copy_str("Failt to find StartTime or Days"),1 ), \
+		End, "Failt to find StartTime or Days\n");
+	// get tap id
+	tap_id *= 100;
+	tap_id += _SCH_TYPE_TAP;
+
+	MDF_LOGD("Set id %llu \n", tap_id);
+	// get tap
+	mlink_json_parse(p_json, "Taps", &p_taps);
+	
+	MDF_ERROR_GOTO(NULL == *p_taps && (*pp_error = (char*)malloc_copy_str("Failt to get Taps"), 1),End, "Failt to get Taps\n");
+	// save sub ... 
+	idx = _sch_list_add_save( _SCH_CMD_TAP, tap_id);
+	MDF_ERROR_GOTO( -1 == idx &&( *pp_error = (char *)malloc_copy_str("Failt to add to flash!") , 1), \
+		End, "Failt to add to flash.\n");
+	
+	rc = _item_sub_add_save(_SCH_CMD_TAP, idx, p_json);
+	MDF_ERROR_GOTO( MDF_OK != rc, End, "Failt to add sub item.\n");
+
+		
+	for(i=0; i< _SCH_TAP_MAX && NULL !=  _p_tap_type[i]; i++){
+
+		mlink_json_parse( p_taps, _p_tap_type[i], &p_value);
+
+		if( p_value ){
+			// get id 
+			sub_id = tap_id + i;
+			rc = _tapsch_sub_save(sub_id, p_value, pp_error);
+			
+			MDF_FREE( p_value );
+			p_value = NULL;
+			if(MDF_OK != rc){
+				char tmp[32] = {0};
+				sprintf(tmp, "Failt to save %s", _p_tap_type[i]);
+				*pp_error = (char *) malloc_copy_str(tmp);
+				break;
+			}
+		}
+	}
+
+	*p_id = tap_id;
+	// reset read position
+	_ctl_position_set( _SCH_CMD_TAP, 0);
+	
+End:
+
+	MDF_FREE( p_taps );
+	MDF_FREE( p_value );
+
+	return rc;
+}
+/*****
+// 设置 tab schedule
+接收到 json:
+{
+  "Method": "TapScheduleSet",
+  "TapSchedule": {... }
+}
+************/
+static mdf_err_t _tapsch_set(char *p_tap, char **pp_repond ,char **pp_error){
+	mdf_err_t  rc = MDF_FAIL;
+	uint64_t tap_id = 0;
+
+	MDF_PARAM_CHECK( p_tap );
+	MDF_PARAM_CHECK( pp_repond );
+
+
+	rc = _tapsch_single_set(p_tap, &tap_id, pp_error);
+	if( MDF_OK == rc)
+		_sch_update(_SCH_CMD_TAP);
+	
+	MDF_FREE(p_tap);
+	p_tap = NULL;
+	
+	if( NULL == *pp_error && tap_id != 0){
+		char p_tmp[32] = {0};
+
+		sprintf(p_tmp, "%llu", tap_id);
+		rc = mlink_json_pack( pp_repond, "id", p_tmp);
+
+		MDF_LOGD("respond id %s \n", *pp_repond);
+	}
+	// get TapSchedule
+	return rc;
+}
+static char *_tap_type_get(uint64_t id){
+
+	int stype  = id % 10;
+		
+	MDF_LOGD("id %llu, type %d \n", id,  stype);
+	if( stype < _SCH_TAP_MAX ){
+		return _p_tap_type[stype];
+	}
+	return NULL;
+}
+/**
+** 构造 tap 结构.
+"TU": 
+{
+"Self": true,
+"Brightness": 100,
+"Fade": 0.5,
+"Countdown": "00:00:00",
+"Additional": {
+  "UseThisBrightness": xxx
+}
+}
+
+*****/
+static mdf_err_t _tap_sub_get(char **pp_tap, int *p_tap_len, uint64_t key_id, char **pp_error){
+
+	// get list 
+	char *p_tap_type = NULL, *p_json = NULL;
+	double fade_d = 0;
+	mdf_err_t rc = MDF_FAIL;
+	Sch_file_t *p_sf = NULL;
+	int sch_len = 0;
+	MDF_PARAM_CHECK(pp_tap);
+	MDF_PARAM_CHECK(p_tap_len);
+
+	p_sf = _sch_file_read_with_id( key_id,  &sch_len);
+	MDF_ERROR_CHECK( (NULL == p_sf &&(*pp_error =(char *) malloc_copy_str( "Failt to read schedule file" ), 1) ), 
+		MDF_FAIL, "Failt to read schedule file \n");
+
+	MDF_LOGD("_tap_sub_get \n");
+
+	//_sch_file_printf(p_sf);
+	// struct to json 
+	rc = _sch_struct2json(&p_json, p_sf, 0);
+	
+	MDF_LOGD("json %s \n", p_json);
+
+	// "TU":{json}
+	p_tap_type = _tap_type_get(p_sf->had.time_id);
+	
+	if( p_tap_type && strlen(p_tap_type) > 0 ){
+		mlink_json_pack( pp_tap, p_tap_type, p_json);
+		MDF_LOGD("Tap %s \n", *pp_tap);
+		rc = MDF_OK;
+	}else{
+		*pp_error = (char *)malloc_copy_str("Failt to find tap schedules.");
+	}
+
+	//MDF_LOGD("1 get tap: %s\n", p_json);
+	
+	MDF_FREE( p_json );
+	p_json = NULL;
+	MDF_FREE( p_sf );
+	p_sf = NULL;
+
+	return rc;
+}
+static mdf_err_t  _tap_sub_del(_Sch_type_t type, uint64_t tid){
+
+	int i =0, len = 0;
+	uint64_t sid = tid;
+	char p_key[64] = {0};
+
+	if( type == _SCH_CMD_TAP){
+		for( i=0; i <_SCH_TAP_MAX; i++ ){
+		
+				sid = tid + i;
+				
+				memset(p_key, 0, 64);
+				sprintf(p_key, "%llu", sid);
+				len = strlen(p_key);
+		
+				MDF_LOGI( "erase key %s \n", p_key);
+				
+				if(len ){
+					mdf_info_erase(p_key);
+				}else {
+					MDF_LOGW("Failt to dele key %llu", sid);
+				}
+			}
+	}else{
+		memset(p_key, 0, 64);
+		sprintf(p_key, "%llu", tid);
+		len = strlen(p_key);
+		if(len ){
+			mdf_info_erase(p_key);
+		}else {
+			MDF_LOGW("Failt to dele key %llu", tid);
+		}
+	}
+	
+	return MDF_OK;	
+}
+/**
+** 构造 tap 结构.
+"TapSchedule": 
+{
+"TU":{},"TD":{}
+}
+*****/
+static mdf_err_t _tapsch_single_get(char **pp_tap, int *p_tap_len, Item_t *p_item, char **pp_error){
+
+	// get list 
+	int64_t t_id = 0;
+	mdf_err_t rc = 0;
+	char *p_json = NULL;
+	
+	int i =0, json_len =0;
+	
+	for(i=0;i<_SCH_TAP_MAX;i++){
+		
+		t_id = p_item->sch_time_key + i;
+		_tap_sub_get( &p_json, &json_len, t_id, pp_error );
+
+		if(p_json){
+			// start time 
+			MDF_LOGD(" p_json %s \n", p_json);
+		}
+		if( *pp_error || NULL == p_json ){
+
+			MDF_LOGW( "Failt  \n");
+
+			MDF_FREE(p_json);
+			return MDF_FAIL;
+		}
+	}
+	if(p_json)	
+		_sch_starttime2json(&p_json, t_id);
+	
+	MDF_ERROR_GOTO( NULL == p_json &&(*pp_error = (char *)malloc_copy_str("Failt to get tap json") ,1), \
+		Error_end, "Failt to get tap json\n");
+	
+	MDF_LOGI("Tap json %s\n", p_json);
+
+
+	*pp_tap = p_json;
+	*p_tap_len = strlen(p_json);
+
+	MDF_LOGE("len  = %d\n", *p_json);
+	return rc;
+
+Error_end:
+
+	MDF_LOGE("Error in tapsch_single-get \n");
+	MDF_FREE(p_json);
+	
+	return rc;
+}
+
+static bool _tapsch_id_in_array(uint64_t id, uint64_t *p_array, int a_size){
+	int i = 0;
+
+	for(i=0; i < a_size; i++){
+		if(id == p_array[i])
+			return true;
+	}
+
+	return false;
+}
+/********
+** 1. delete all the tu/td/dtd/dtu
+** 2. delete sub item.
+** 3. remove key from list.
+*******/ 
+static mdf_err_t _tap_sch_del_one(_Sch_type_t type, Item_t  *p_item){
+	mdf_err_t rc = MDF_OK;
+	/********
+	** 1. delete all the tu/td/dtd/dtu
+	****/
+	rc = _tap_sub_del(type, p_item->sch_time_key);
+
+	/***
+	** 2. delete sub item.
+	***/
+	
+	rc = item_sub_del( type , p_item->idx);
+	/***
+	** 3. remove key from list.
+	*******/ 
+	rc = _sch_list_remove(type, p_item->sch_time_key);
+	
+	return rc;
+}
+/**********
+delete tap schedule 
+**/
+static mdf_err_t _tapsch_del(_Sch_type_t type, int del_all, char **pp_respond , uint64_t *p_del_id, int del_len, char **pp_error){
+	mdf_err_t rc = 0;
+	Sch_List_t *p_sch_list = NULL;
+	int i=0, nums = 0;
+	char *p_re = NULL;
+
+	if( 0 == del_all && NULL == p_del_id)
+		return rc;
+	
+	p_sch_list = _sch_List_t_get( type );
+	MDF_ERROR_CHECK( NULL == p_sch_list && ( *pp_error = (char *)malloc_copy_str("Failt read schedule"), 1 ) ,
+		MDF_FAIL, "Failt read schedule\n");
+	
+	nums = _ctl_nums_get( type );
+
+	
+	for( i=0; i< nums; i++){
+		
+		if( del_all || _tapsch_id_in_array( p_sch_list->p_list[i].sch_time_key, p_del_id, del_len) ){
+			// del one 
+			rc = _tap_sch_del_one(type, &p_sch_list->p_list[i]);
+			
+			if( MDF_OK == rc){
+				char p_tmp[64] = {0};
+				int tmp_len = 0;
+
+				// [12,34,56,78]
+				sprintf(p_tmp, "%llu", p_sch_list->p_list[i].sch_time_key );
+
+				MDF_LOGI( "del id %s \n", p_tmp);
+				
+				tmp_len = (int) strlen( p_tmp );
+				if( tmp_len > 0){
+					if( p_re == NULL){
+						p_re = MDF_MALLOC(2);
+						p_re[0] = '[';
+						p_re[1] = '\0';
+					
+					}else{
+						int nlen = strlen( p_re )  + 1;
+						p_re = MDF_REALLOC(p_re,  nlen );
+						p_re[nlen - 1] = ',';
+						p_re[nlen] = '\0';
+					}
+
+					tmp_len = strlen( p_re ) + tmp_len + 1;
+					p_re = MDF_REALLOC(p_re, tmp_len );
+					
+					MDF_ERROR_GOTO( NULL == p_re &&(*pp_error = (char*)malloc_copy_str("Failt to realloc"),1), \
+						End, "Failt to realloc \n" );
+
+					strcat(p_re, p_tmp);
+					p_re[ tmp_len -1] = '\0';
+					
+					MDF_LOGI( "del ids  %s \n", p_re);
+				}
+			}else{
+				MDF_LOGE("Failt to del %llu \n", p_sch_list->p_list[i].sch_time_key );
+			}
+			
+		}
+	}
+	
+	if(p_re && strlen(p_re) > 0){
+
+		int nlen = strlen( p_re )  + 2;
+		
+		MDF_LOGI( "del ids	%s \n", p_re);
+		p_re = MDF_REALLOC(p_re,  nlen );
+		MDF_LOGI( "del ids	%s \n", p_re);
+				
+		if(p_re){
+			p_re[nlen -2] = ']';
+			p_re[nlen -1] = '\0';
+			
+			MDF_LOGI( "del ids	%s \n", p_re);
+			*pp_respond = p_re;
+			p_re = NULL;
+		}
+		
+	}
+	_sch_update(type);
+End:
+
+	MDF_FREE(p_sch_list);
+	MDF_FREE(p_re);
+
+	return rc;
+}
+/**
+** {"taps":[ { x },{ x } ]}
+*****/
+static mdf_err_t _tapsch_get(char **pp_taps, char **pp_error){
+
+	int i=0, total_len =0, new_len = 0, nums = 0;
+	char *p_taps = NULL, *p_new = NULL;
+	
+	Sch_List_t *p_sch_list = NULL;
+	
+	p_sch_list = _sch_List_t_get( _SCH_CMD_TAP );
+
+	MDF_ERROR_CHECK( NULL == p_sch_list && ( *pp_error = (char *)malloc_copy_str("Failt read schedule"), 1 ) ,
+		MDF_FAIL, "Failt read schedule\n");
+
+	nums = _ctl_nums_get( _SCH_CMD_TAP );
+	
+	MDF_LOGD("Device have %d \n", nums);
+	
+	new_len = 4;
+	p_taps = utlis_malloc( new_len );
+	MDF_ERROR_CHECK( NULL == p_taps && ( *pp_error = (char *)malloc_copy_str("Failt to alloc"), 1 ) ,
+		MDF_FAIL, "Failt to alloc\n");
+	
+	p_taps[0]='['; 
+	total_len = 1;
+	for( i=0;i< nums; i++ ){
+
+		if(i <_ctl_position_get( _SCH_CMD_TAP ) ){
+			MDF_LOGI("skip %d\n", i);
+			continue;
+		}
+		
+		// p_new = "TapSchedule": [{"head":xx,"TU":{}, "TD":{} }]
+		_tapsch_single_get(&p_new, &new_len, &p_sch_list->p_list[i], pp_error);
+
+		// error happend.
+		if( *pp_error || (p_new == NULL || 0 == new_len) ){
+			_ctl_position_set( _SCH_CMD_TAP, 0);
+			
+			MDF_LOGW("error \n");
+			if(*pp_error)
+				MDF_LOGW("Error: %s\n", *pp_error);
+			
+			MDF_FREE(p_taps);
+			p_taps = NULL;
+			break;
+		}
+		
+		MDF_LOGD("get json %s \n", p_new);
+		if( ( total_len + new_len ) > _PACKAGE_MAX_LEN ){
+			//i -=1;
+			MDF_LOGE("Free p_new \n");
+			MDF_FREE(p_new);
+			p_new = NULL;
+			new_len = 0;
+			break;
+		}
+		MDF_LOGI("get sub  schedule %s\n ", p_new);
+		
+		total_len += new_len + 1;
+
+		MDF_LOGD( "tap len = %d, new len = %d \n", strlen( p_taps ), strlen( p_new ) );
+		MDF_LOGD("total len = %d\n", total_len);
+		MDF_LOGD("free %u \n", esp_get_free_heap_size());
+		p_taps = MDF_REALLOC(p_taps ,  total_len );
+		
+		if(p_taps){
+			strcat( p_taps, p_new );
+			MDF_LOGI("get schedule %s\n ", p_taps);
+
+		}else{
+			MDF_LOGE("Failt to realloc \n");
+		}
+
+		MDF_FREE(p_new);
+		p_new = NULL;
+		new_len = 0 ;
+
+	}
+	
+	
+	if(   p_taps ){
+
+		total_len = strlen(p_taps) + 2;
+		
+		MDF_LOGI("get tap schedule %s\n ", p_taps);
+		MDF_LOGD("total len = %d\n", total_len);
+
+		p_taps = MDF_REALLOC( p_taps,  total_len );
+		
+		if(p_taps){
+			
+			int Remaining  = 0;
+			p_taps[ total_len - 2 ] = ']';
+			p_taps[ total_len -1 ] = '\0';	
+
+			
+			i = (i >= nums)?nums:i;
+			Remaining = nums - i;
+			_ctl_position_set( _SCH_CMD_TAP, i);
+			MDF_LOGI("get tap schedule %s\n ", p_taps);
+			
+			mlink_json_pack(pp_taps, "TapSchedule",  p_taps );
+			mlink_json_pack(pp_taps, "Remaining",  Remaining);
+			
+			MDF_FREE(p_taps);
+			p_taps = NULL;
+			
+		}else{
+			MDF_LOGE("Failt to alloc \n");
+		}
+	}
+
+	MDF_FREE(p_new);
+	return MDF_OK;
+}
+
+/*****
+** del schedule. 
+**
+{
+	"data":{
+		"TapSchedule":["id_1", "id_2"],
+		"All":1
+	}
+}
+**
+********/ 
+static mdf_err_t _tapsch_get_array_id(uint64_t *pp_id, int *p_len, char *p_src){
+	cJSON *p_array = NULL, *p_item = NULL;
+	uint64_t *p_dst = NULL;
+	int count = 0;
+
+	MDF_LOGD("src %s \n", p_src);
+	
+	cJSON *p_cjson = cJSON_Parse( p_src );
+	if(p_cjson){
+
+		
+		p_array = cJSON_GetObjectItemCaseSensitive(p_cjson, "deleteIds");
+
+		MDF_LOGD("1 p_array %p \n", p_array);
+
+		if( p_array && cJSON_IsArray( p_array)){
+
+			MDF_LOGD("1 \n");
+			cJSON_ArrayForEach(p_item, p_array){
+				if( cJSON_IsString( p_item ) ){
+					
+					count += 1;
+					p_dst = MDF_REALLOC(p_dst, count * sizeof( uint64_t ) );
+
+					MDF_LOGD( "2 \n");
+					sscanf( p_item->valuestring, "%llu", &p_dst[count - 1]);
+					MDF_LOGI("src %s, id %llu \n", p_item->valuestring, p_dst[count - 1]);
+				}	
+			}
+		}
+		MDF_LOGD("3 \n");
+		cJSON_Delete(p_cjson);
+	}
+	MDF_LOGD("3 \n");
+
+	if( p_dst && count > 0 ){
+		*pp_id = p_dst;
+		*p_len = count;
+	}else{
+		MDF_FREE(p_dst);
+	}
+	
+	return MDF_OK;
+}
+mdf_err_t mlink_schedule_del(mlink_handle_data_t        *p_mdata )
+{
+
+	mdf_err_t rc = MDF_FAIL;
+	int all = 0, status_code = 300, id_len = 0;
+	uint64_t *p_array = NULL;
+	char  *p_error = NULL, *p_respond = NULL, *p_data = NULL;
+
+	MDF_PARAM_CHECK( p_mdata );
+	MDF_PARAM_CHECK( p_mdata->req_data );
+	
+	MDF_LOGW("mlink_schedule_del src %s \n",  p_mdata->req_data);
+
+	// get data 
+	mlink_json_parse( p_mdata->req_data, "data", &p_data);
+	
+	MDF_ERROR_GOTO( NULL == p_data && (p_error = (char*)malloc_copy_str("Failt to get data from json" ), 1), \
+		End, "Failt to get data from json \n");
+	
+	// get del
+	mlink_json_parse( p_data, "All", &all );
+	// 
+	_tapsch_get_array_id(&p_array, &id_len, p_data);
+
+	if( all > 0 || ( p_array && id_len > 0) ){
+		_tapsch_del(_SCH_CMD_TAP, all, &p_respond, p_array, id_len, &p_error);
+	}else{
+		p_error = (char *) malloc_copy_str("Can't find All or TapSchedule.");
+	}
+	
+End:
+
+	if( p_error ){
+		
+		status_code = 300;
+		MDF_FREE(p_respond);
+		p_respond = p_error;
+
+	}else {
+		status_code = 200;
+	}
+
+	rc = mevt_command_respond_creat( (char *)p_mdata->req_data, status_code, p_respond);
+	
+	MDF_FREE( p_respond );
+	MDF_FREE( p_error );
+
+	return rc;
+}
+
+/*****
+** get schedule. 
+**
+{
+	"data":{
+		"TapSchedule":[{TapSchedule1},{TapSchedule2}],
+		"Remaining":xxx
+	}
+}
+**
+********/ 
+mdf_err_t mlink_schedule_get(mlink_handle_data_t        *p_mdata )
+{
+	mdf_err_t rc = MDF_FAIL;
+	int status_code = 300, begin = 0;
+	char *p_tap = NULL, *p_error = NULL, *p_respond = NULL, *p_data = NULL;
+
+	MDF_PARAM_CHECK(p_mdata);
+	MDF_PARAM_CHECK(p_mdata->req_data);
+
+	MDF_LOGD("Receive %s \n", p_mdata->req_data);
+
+	mlink_json_parse(p_mdata->req_data, "data", &p_data);
+
+	if(p_data){
+		
+		mlink_json_parse(p_data, "begin", &begin);
+		MDF_LOGD("begin %d \n", begin);
+
+		if(begin)
+			_ctl_position_set( _SCH_CMD_TAP, 0);
+
+		MDF_FREE(p_data);
+		p_data = NULL;
+	}
+	
+	rc = _tapsch_get(&p_tap, &p_error);
+	
+	if( p_error ){
+		status_code = 300;
+		MDF_FREE(p_tap);
+		p_tap = NULL;
+		p_respond = p_error;
+	}else {
+		status_code = 200;
+		p_respond = p_tap;
+	}
+
+	rc = mevt_command_respond_creat( (char *)p_mdata->req_data, status_code, p_respond);
+	
+	MDF_FREE( p_tap );
+	MDF_FREE( p_error );
+	
+	return rc;
+}
+mdf_err_t mlink_schedule_set(mlink_handle_data_t        *p_mdata )
+{
+	mdf_err_t rc = MDF_OK;
+	char *p_data = NULL, *p_tab = NULL, *p_rep = NULL, *p_rep_data = NULL;
+	int status_code = 300;
+	
+	MDF_PARAM_CHECK(p_mdata);
+	MDF_PARAM_CHECK(p_mdata->req_data);
+
+	MDF_LOGD("sch set get %s\n", p_mdata->req_data);
+
+	// get data
+	rc = mlink_json_parse( p_mdata->req_data, "data",  &p_data);
+	MDF_ERROR_GOTO( ( NULL == p_data && ( p_rep =(char *)malloc_copy_str("Failt No data\n"), 1) ) , \
+		End_Respond, "Failt No data\n");
+	
+	rc = mlink_json_parse( p_data, "TapSchedule", &p_tab);
+	MDF_ERROR_GOTO( ( NULL == p_tab && ( p_rep =(char *)malloc_copy_str("Failt No TapSchedule\n"), 1) ) , \
+		End_Respond, "Failt No TapSchedule\n");
+	MDF_FREE(p_data);
+	p_data = NULL;
+
+	_tapsch_set( p_tab, &p_rep_data,  &p_rep);
+	if( p_rep ){
+		status_code = 300;
+		MDF_FREE(p_rep_data);
+		p_rep_data = NULL;
+	}else {
+		status_code = 200;
+		p_rep = p_rep_data;
+	}
+
+End_Respond:
+
+	rc = mevt_command_respond_creat( (char *)p_mdata->req_data, status_code, p_rep);
+	MDF_FREE(p_data);
+	MDF_FREE(p_rep);
+	
+	return rc;
+}
+
+static uint8_t  _int2bin(uint64_t in_data){
+
+	uint8_t data = 0, i =0;
+	
+	if(!in_data)
+		return data;
+
+	for(;i<8;i++){
+		if( ( in_data % 10) > 0)
+			data = data | (0x01 << i);
+		in_data = in_data / 10;
+
+		if( in_data == 0 )
+			break;
+	}
+	return data;
+}
+static int _get_week(uint8_t b_week){
+	int week = 0;
+	uint8_t tmp = b_week;
+	for(week=1, tmp = b_week; tmp != 0x01; tmp = b_week >> (week - 1) ){
+			week++;
+			if(week > 8 ){
+				return 0;
+			}
+	}
+	return week;
+}
+
+static uint64_t _max_diff_get(uint8_t b_ctime,uint8_t  b_tid, uint64_t c_second, uint64_t t_second ){
+	int i = 0, w_dt = 0, count_en  = 0, week = 0, zone = 0;
+	uint8_t tmp = b_ctime;
+	uint64_t max_diff = 0, week_base_time = c_second - (c_second % 86400), c_week_time  = 0;
+
+	zone = local_time_zone_get();
+
+	MDF_LOGE("current zone is %d \n", zone );
+	c_week_time = _WEEK_TIME_GET(c_second, zone );
+	week = _get_week(b_ctime);
+	
+	for(i = b_ctime, w_dt =0; i >0 &&  w_dt < 8; i = b_ctime << w_dt){
+			if(  b_tid & i  ){
+			    if(w_dt == 0 && c_week_time >= t_second ){
+			        
+			    }else{
+					max_diff = c_second + ((int)t_second - (int) c_week_time ) + w_dt * 86400;
+					count_en = 1;
+					break;
+			    }
+			}
+			w_dt++;
+		}
+
+		if( count_en == 0 ){
+			week = _get_week( b_ctime );
+			w_dt = _get_week( b_tid );
+			MDF_LOGE("week %d df %d \n", week, w_dt);
+			//MDF_LOGE("week %d, w_dt %   \n", week, w_dt);
+			max_diff = ( 7 -  DIFF( w_dt, week ) ) * 86400   +  c_second  +  ((int)t_second - (int) c_week_time );
+		}
+	
+	MDF_LOGE("current time  %llu  t time %llu \n", c_week_time, t_second);
+	return max_diff;
+}
+
+static uint64_t _min_diff_get(uint8_t b_ctime,uint8_t  b_tid, uint64_t c_second, uint64_t t_second ){
+	int i = 0, w_dt = 0, count_en  = 0, week = 0, zone = 0;
+	uint8_t tmp = b_ctime;
+	uint64_t min = 0, week_base_time = c_second - (c_second % 86400), c_week_time  = 0;
+	
+	zone = local_time_zone_get();
+	MDF_LOGE("current zone is %d \n", zone );
+	c_week_time = _WEEK_TIME_GET(c_second, zone );
+	week = _get_week(b_ctime);
+
+	week = _get_week(b_ctime);
+
+	for(i = b_ctime, w_dt =0; i >0 && w_dt < 8; i = b_ctime >> w_dt){
+			if(  b_tid & i	){
+				if( w_dt ==0 &&  t_second > c_week_time  ){
+					
+				}else{
+					min = c_second + ((int)t_second - (int) c_week_time ) - w_dt * 86400;
+					count_en = 1;
+					break;
+				}
+			}
+			w_dt++;
+		}
+
+		if( count_en == 0 ){
+			week = _get_week(b_ctime);
+			w_dt = _get_week(b_tid);
+			min = c_second - ( 7 -  DIFF( w_dt, week) ) * 86400    +  ((int)t_second - (int) c_week_time );
+		}
+		
+	return min;
+}
+
+int _sch_count_diff(uint64_t *p_next_time, uint64_t *p_min_sec, uint64_t *p_max_sec , uint64_t t_id){
+	uint8_t week_ctime = 0, week_tid = 0;
+	int week = utils_get_current_week(), i = 0;
+	uint64_t t_time = 0, ctime = utils_get_current_time_ms() ;
+	// get week 
+	week_tid = _int2bin(t_id / _BYTE_SECOND);
+
+	// get byte week
+	MDF_LOGE("current week %d \n", week);
+	week_ctime =  0x01 << (week - 1);
+	
+	// get current time 
+	ctime = ctime / 1000;
+	t_time = (t_id / _BYTE_FUNCTION) % (100000);
+
+	*p_min_sec  = _min_diff_get(week_ctime,week_tid, ctime, t_time );
+	*p_max_sec  = _max_diff_get(week_ctime,week_tid, ctime, t_time );
+	
+	if( (*p_max_sec) > 0  )
+		*p_next_time =  (*p_max_sec );
+
+	MDF_LOGE("Min sec %llu \n", (*p_min_sec) );
+	MDF_LOGE("Max sec %llu \n", (*p_max_sec) );
+	
+	MDF_LOGE("t_time %llu current time %llu  next sec %llu \n",  t_time,ctime, (*p_next_time) );
+	
+	return 0;
+}
+/*** schedule 获取当前生效的 alarm 或者 schedules *
+**输入： type: alram 或者是 schedule  c_time 当前时间单位精确到秒.
+**输出：p_curr_id 当前生效schedule,  next id, next_time
+***************************************************************************/
+mdf_err_t _sch_close_excel_id_get(_Sch_type_t type, uint64_t *p_next_secend, uint64_t *p_curr_id, uint64_t *p_next_id){
+	uint64_t curr_id = 0, next_id = 0, old_min =0, min =0, old_max = 0, max =0, next_secend = 0;
+	
+	int nums = 0;
+	Sch_List_t *p_sch_list = NULL;
+
+	
+	nums = _ctl_nums_get( type );
+	p_sch_list = _sch_List_t_get( type );
+	if(p_sch_list && nums){
+		int i =0;
+		
+		for(i=0;i<nums;i++){
+			_sch_count_diff( &next_secend, &min, &max, p_sch_list->p_list[i].sch_time_key);
+			if( old_min ==0 ||  min > old_min ){
+				old_min = min;
+				curr_id = p_sch_list->p_list[i].sch_time_key;
+			}
+			if( old_max ==0 || old_max > max ){
+				old_max =  max;
+				*p_next_secend = next_secend;
+				next_id = p_sch_list->p_list[i].sch_time_key;
+			}
+		}
+	}else{
+		if(nums)
+			MDF_LOGE("Failt to get sch list! \n");
+		return 0;
+	}
+
+ 	MDF_LOGD( "Active current id %llu \n", curr_id );
+ 	MDF_LOGD( "Active next id %llu \n", next_id );
+	MDF_LOGD( "nexet second %llu \n", next_secend );
+	
+	*p_curr_id = (curr_id > 0 )?curr_id:*p_curr_id;
+	*p_next_id = (next_id > 0 )?next_id:*p_next_id;
+	
+	return 0;
+}
+/***
+** 接收到 
+"data": {
+    "method": "alarm_get",
+    "from_beginning": 1
+  }
+*******************/
+mdf_err_t mlink_current_get(mlink_handle_data_t        *p_mdata )
+{
+	mdf_err_t rc = MDF_FAIL;
+	int status_code = 300, begin = 0;
+	char  *p_respond = NULL, *p_data = NULL;
+	char p_tmp[128] = {0};
+	uint64_t next_secend_alarm, alarm_id_current, alarm_id_next, next_secend_sch, tap_id_current, tap_id_next;
+	
+	MDF_PARAM_CHECK(p_mdata);
+	MDF_PARAM_CHECK(p_mdata->req_data);
+
+	_sch_close_excel_id_get(_SCH_CMD_ALAM, &next_secend_alarm, &alarm_id_current,  &alarm_id_next);
+	_sch_close_excel_id_get(_SCH_CMD_TAP, &next_secend_sch, &tap_id_current,  &tap_id_next);
+
+
+	//alarm_loop_detect(NULL);
+
+	sprintf(p_tmp, "[%llu, %llu, %llu]", next_secend[_SCH_CMD_ALAM], current_id[_SCH_CMD_ALAM], next_id[_SCH_CMD_ALAM] );
+	mlink_json_pack(&p_respond, "alarm:", p_tmp);
+	memset(p_tmp, 0, 128);
+
+	sprintf(p_tmp, "[%llu, %llu, %llu]", next_secend[_SCH_CMD_TAP], current_id[_SCH_CMD_TAP], next_id[_SCH_CMD_TAP]);
+	mlink_json_pack(&p_respond, "TapSchedule:", p_tmp);
+
+	status_code = 200;
+
+	rc = mevt_command_respond_creat( (char *)p_mdata->req_data, status_code, p_respond);
+
+	MDF_FREE(p_respond);
+	return rc;
+}
+
+static void _sch_update(_Sch_type_t type){
+
+	next_secend[type] = 0;
+	current_id[type] = 0;
+	next_id[type] =0;
+	
+	_sch_close_excel_id_get(type, &next_secend[type], &current_id[type], &next_id[type] );
+	
+	if(type == _SCH_CMD_TAP)
+		_sch_tap_setting_update(current_id[_SCH_CMD_TAP]);
+}
+
+static int _sch_additional_excel(Sch_file_t *p_sch){
+	// todo
+	return 0;
+}
+/**
+*** 执行 当前配置
+*****/
+static int sch_excel(Sch_file_t *p_sch){
+	int ret = 0;
+	int power_s = -1, bri_s = -1;
+	float fade_s = -1;
+
+	if( NULL == p_sch){
+		MDF_LOGE("NULL sch \n");
+		return -1;
+		}
+	// todo remove 
+	_sch_file_printf(p_sch);
+	
+	if(p_sch->had.self){
+		bri_s = p_sch->had.bri;
+		if(bri_s == 0)
+			power_s =  0;
+		else
+			power_s = 1;
+		fade_s = p_sch->had.fade / 1000.0;
+		light_change_user(power_s, bri_s, fade_s, -1);
+	}
+
+	// todo handle  addition
+	if( p_sch->data_len > 0 ){
+		_sch_additional_excel(p_sch);
+	}
+	
+	return ret;
+}
+static void _sch_tap_setting_clean(void){
+	int i  ;
+	for(i =0; i < _SCH_TAP_MAX; i++){
+		MDF_FREE(p_sch_tap[i])
+		p_sch_tap[i] =  NULL;
+	}
+}
+// 刷新 当前 tu td dtu dtd 配置
+static void _sch_tap_setting_update(uint64_t tid){
+	int i;
+	uint64_t id = 0, sch_len =0;
+	Sch_file_t *p_sch = NULL;
+
+	MDF_LOGD("Active tap id %llu \n", tid); 
+	
+	_sch_tap_setting_clean();
+	if(  (tid % 100) != _SCH_TYPE_TAP  ){
+		
+		MDF_LOGE("Not tap id !! \n" );
+		return ;
+	}
+	
+	for(i=0;i < _SCH_TAP_MAX;i++){
+		
+		id =  tid + i;
+		p_sch = _sch_file_read_with_id( id,  &sch_len);
+		if(p_sch){
+			MDF_FREE(p_sch_tap[i]);
+			p_sch_tap[i] =  p_sch;
+			MDF_LOGD("Update Tap event %d \n", i);
+			_sch_file_printf(p_sch_tap[i]);
+		}else{
+			MDF_LOGE("No tap sch in flash id = %llu \n", id);
+		}
+	}
+}
+
+int tap_event_active(_Sch_tap_T evt){
+	
+	if( _ctl_nums_get(_SCH_CMD_TAP) > 0 &&  evt <_SCH_TAP_MAX ){
+		MDF_LOGE("Tap event %d \n", evt);
+		return sch_excel(p_sch_tap[evt]);
+	}else
+		MDF_LOGE("Not tap event \n");
+	
+	return -1;
+}
+void _sch_active_(_Sch_type_t type, uint64_t id){
+	if( 0 != id  && type == _SCH_CMD_ALAM){
+		// active alarm
+		Sch_file_t *p_sch = NULL;
+		int sch_len = 0;
+
+		MDF_LOGD("Excel Alarm %llu \n", id);
+		
+		p_sch = _sch_file_read_with_id( id,  &sch_len);
+		sch_excel(p_sch);
+		MDF_FREE(p_sch);
+	}
+	// update 
+	_sch_close_excel_id_get(type, &next_secend[type], &current_id[type], &next_id[type] );
+
+	// active schedules
+	if(type == _SCH_CMD_TAP && current_id[type] != 0){
+	 // todo
+		_sch_tap_setting_update(current_id[type]);
+	}
+
+}
+/*** alarm handle 
+***************************/
+static mdf_err_t alarm_loop_detect(void *p_arg){
+
+	int i  =0;
+	
+	uint64_t ctime = utils_get_current_time_ms() / 1000;
+
+	if( ctime < 1597398677)
+		return 0;
+	
+	for(i=0; i < _SCH_CMD_MAX; i++ ){
+		
+		//MDF_LOGE("Nums %d Current time %llu, next_sec %llu \n", _ctl_nums_get(i),  ctime , next_secend[i]);
+		if( ctime >= next_secend[i] && _ctl_nums_get(i) > 0 &&  local_time_zone_get() != 0 ){
+			MDF_LOGD("Current time %llu, next_sec %llu \n", ctime , next_secend[i]);
+			_sch_active_(i, next_id[i]);
+		}
+	}
+	return MDF_OK;
+}
+mdf_err_t schedule_init(void){
+
+	esp_log_level_set(TAG, ESP_LOG_VERBOSE);
+
+	if( mdf_info_load("schedule_nums",  &_ctl.p_had, ( sizeof(Sch_had_t) *  _SCH_CMD_MAX) ) != MDF_OK ){
+		_ctl.p_had[_SCH_CMD_TAP].nums = 0;
+		_ctl.p_had[_SCH_CMD_ALAM].nums = 0;
+		mdf_info_save("schedule_nums",  &_ctl.p_had , ( sizeof(Sch_had_t) *  _SCH_CMD_MAX) );
+	}
+
+	frtc_function_register(FRTC_CMD_SCH , alarm_loop_detect, NULL);
+	
+	MDF_ERROR_ASSERT( mlink_set_handle("AlarmSet", mlink_alarm_set));
+	MDF_ERROR_ASSERT( mlink_set_handle("AlarmDel", mlink_alarm_del));
+	MDF_ERROR_ASSERT( mlink_set_handle("AlarmGet", mlink_alarm_get));
+
+	MDF_ERROR_ASSERT( mlink_set_handle("CurrentGet", mlink_current_get));
+	MDF_ERROR_ASSERT( mlink_set_handle("ScheduleGet", mlink_schedule_get));
+	MDF_ERROR_ASSERT( mlink_set_handle("ScheduleDel", mlink_schedule_del));
+
+	MDF_ERROR_ASSERT( mlink_set_handle("ScheduleSet", mlink_schedule_set));
+
+	return MDF_OK;
+}
+
+mdf_err_t schedule_deinit(void){
+
+	return MDF_OK;
+}
+
